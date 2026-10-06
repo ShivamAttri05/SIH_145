@@ -143,6 +143,12 @@ def serialize_alert(
         "behavior_contribution":
             alert.behavior_contribution,
 
+        "c2_risk_contribution":
+            alert.c2_risk_contribution,
+
+        "tls_risk_contribution":
+            alert.tls_risk_contribution,
+
         "risk_score":
             alert.risk_score,
 
@@ -326,20 +332,23 @@ def root():
 )
 def health():
 
-    return {
+    db = SessionLocal()
 
-        "status":
-            "healthy",
+    try:
+        db_alerts = get_alerts_from_db(
+            db,
+            limit=MAX_ALERTS
+        )
 
-        "service":
-            "threat-detection-engine",
+        return {
+            "status": "healthy",
+            "service": "threat-detection-engine",
+            "model_loaded": detector.model is not None,
+            "alerts_in_memory": len(db_alerts)
+        }
 
-        "model_loaded":
-            detector.model is not None,
-
-        "alerts_in_memory":
-            len(alerts)
-    }
+    finally:
+        db.close()
 
 
 # ============================================================
@@ -468,6 +477,12 @@ def analyze_traffic(
         behavior_contribution=result[
             "behavior_contribution"
         ],
+
+        c2_risk_contribution=result[
+            "c2_risk_contribution"
+        ],
+
+        tls_risk_contribution=0.0,
 
         severity=result[
             "severity"

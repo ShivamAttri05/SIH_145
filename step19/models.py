@@ -73,6 +73,17 @@ class Alert(Base):
         nullable=True,
     )
 
+    c2_risk_contribution: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+
+    tls_risk_contribution: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
 
     rule_contribution: Mapped[float | None] = mapped_column(
         Float,

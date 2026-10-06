@@ -30,6 +30,8 @@ def create_alert(
         severity=alert_data.severity,
         evidence=alert_data.evidence,
         features=alert_data.features,
+        c2_risk_contribution=alert_data.c2_risk_contribution,
+        tls_risk_contribution=alert_data.tls_risk_contribution,
     )
 
 

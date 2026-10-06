@@ -10,6 +10,7 @@ npm-debug.log
 __pycache__/
 *.pyc
 venv/
+.venv/
 
 # Java
 *.class

@@ -24,6 +24,10 @@ class AlertCreate(BaseModel):
 
     behavior_contribution: float | None = None
 
+    c2_risk_contribution: float | None = None
+
+    tls_risk_contribution: float | None = None
+
     risk_score: float
 
     severity: str

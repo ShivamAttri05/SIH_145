@@ -1,2029 +1,1015 @@
 from scapy import asn1packet
-
 from sqlalchemy.engine import result
-
 from pyexpat import features
-
 import asyncio
-
 import os
-
 import time
-
 import uuid
-
 from datetime import datetime, timezone
-
-
 
 from scapy.all import rdpcap, IP, TCP, UDP
 
-
-
 from step16.detection_service import DetectionService
-
 from step19.database import SessionLocal
-
 from step19.schemas import AlertCreate
-
 from step19.alert_repository import create_alert
 
 
-
-
-
 # ============================================================
-
 # CONFIGURATION
-
 # ============================================================
-
-
 
 WINDOW_SIZE = 10.0
 
-
-
 MODEL_FILE = (
-
     "step14/models/threat_detection_model.pkl"
-
 )
 
 
-
-
-
 # ============================================================
-
 # LIVE STREAM SERVICE
-
 # ============================================================
-
-
 
 class LiveStreamService:
 
-
-
     def __init__(
-
         self,
-
         manager,
-
     ):
-
         self.manager = manager
-
         self.detector = DetectionService()
-
         self.running = False
 
-
-
         # Source-level packet history used for
-
         # behavioral intelligence such as C2 beaconing.
-
         self.source_history = {}
 
-
-
     # ========================================================
-
     # CREATE SOURCE RECORD
-
     # ========================================================
-
-
 
     def create_source_record(self):
 
-
-
         return {
-
-
 
             "packets": 0,
 
-
-
             "bytes": 0,
-
-
 
             "destination_ips": set(),
 
-
-
             "destination_ports": set(),
-
-
 
             "timestamps": [],
 
-
-
             "tcp_packets": 0,
-
-
 
             "syn_packets": 0,
 
-
-
             "ack_packets": 0,
-
-
 
             "rst_packets": 0,
 
-
-
             "fin_packets": 0,
-
-
 
             "dns_packets": 0,
 
-
-
             "packet_objects": [],
-
         }
-
     # ========================================================
-
     # PROCESS PACKET
-
     # ========================================================
-
-
 
     def process_packet(
-
         self,
-
         record,
-
         packet,
-
         update_history=True
-
     ):
-
-
 
         if IP not in packet:
 
-
-
             return
-
-
 
         if update_history:
 
-
-
             source_ip = packet[IP].src
 
-
-
             if source_ip not in self.source_history:
-
                 self.source_history[source_ip] = []
 
-
-
             self.source_history[source_ip].append(
-
                 packet
-
             )
-
-
-
+        
         record[
-
             "packet_objects"
-
         ].append(
-
             packet
-
         )
-
-
 
         record["packets"] += 1
 
-
-
         record["bytes"] += len(packet)
 
-
-
         record[
-
             "destination_ips"
-
         ].add(
-
             packet[IP].dst
-
         )
-
-
 
         record[
-
             "timestamps"
-
         ].append(
-
             float(packet.time)
-
         )
 
-
-
         # ----------------------------------------------------
-
         # Destination port
-
         # ----------------------------------------------------
-
-
 
         if TCP in packet:
 
-
-
             record[
-
                 "destination_ports"
-
             ].add(
-
                 packet[TCP].dport
-
             )
 
-
-
             record[
-
                 "tcp_packets"
-
             ] += 1
-
-
 
             flags = packet[TCP].flags
 
-
-
             if flags & 0x02:
 
-
-
                 record[
-
                     "syn_packets"
-
                 ] += 1
-
-
 
             if flags & 0x10:
 
-
-
                 record[
-
                     "ack_packets"
-
                 ] += 1
-
-
 
             if flags & 0x04:
 
-
-
                 record[
-
                     "rst_packets"
-
                 ] += 1
-
-
 
             if flags & 0x01:
 
-
-
                 record[
-
                     "fin_packets"
-
                 ] += 1
-
-
 
         elif UDP in packet:
 
-
-
             record[
-
                 "destination_ports"
-
             ].add(
-
                 packet[UDP].dport
-
             )
 
-
-
         # ----------------------------------------------------
-
         # DNS
-
         # ----------------------------------------------------
-
-
 
         if TCP in packet:
 
-
-
             if (
-
                 packet[TCP].sport == 53
-
                 or
-
                 packet[TCP].dport == 53
-
             ):
 
-
-
                 record[
-
                     "dns_packets"
-
                 ] += 1
-
-
 
         elif UDP in packet:
 
-
-
             if (
-
                 packet[UDP].sport == 53
-
                 or
-
                 packet[UDP].dport == 53
-
             ):
 
-
-
                 record[
-
                     "dns_packets"
-
                 ] += 1
 
-
-
     # ========================================================
-
     # BUILD FEATURES
-
     # ========================================================
-
-
 
     def build_features(
-
         self,
-
         record
-
     ):
-
-
 
         packets = record["packets"]
 
-
-
         if packets == 0:
-
-
 
             return None
 
-
-
         bytes_count = record["bytes"]
 
-
-
         timestamps = sorted(
-
             record["timestamps"]
-
         )
 
-
-
         # ----------------------------------------------------
-
         # Duration
-
         # ----------------------------------------------------
-
-
 
         if len(timestamps) > 1:
 
-
-
             duration = (
-
                 max(timestamps)
-
                 - min(timestamps)
-
             )
 
-
-
         else:
-
-
 
             duration = 0.0
 
-
-
         if duration > 0:
 
-
-
             packets_per_sec = (
-
                 packets / duration
-
             )
-
-
 
             bytes_per_sec = (
-
                 bytes_count / duration
-
             )
 
-
-
         else:
-
-
 
             packets_per_sec = 0.0
 
-
-
             bytes_per_sec = 0.0
 
-
-
         # ----------------------------------------------------
-
         # TCP ratios
-
         # ----------------------------------------------------
-
-
 
         tcp_packets = (
-
             record["tcp_packets"]
-
         )
-
-
 
         if tcp_packets > 0:
 
-
-
             syn_ratio = (
-
                 record["syn_packets"]
-
                 / tcp_packets
-
             )
-
-
 
             ack_ratio = (
-
                 record["ack_packets"]
-
                 / tcp_packets
-
             )
-
-
 
             rst_ratio = (
-
                 record["rst_packets"]
-
                 / tcp_packets
-
             )
-
-
 
             fin_ratio = (
-
                 record["fin_packets"]
-
                 / tcp_packets
-
             )
-
-
 
         else:
 
-
-
             syn_ratio = 0.0
-
             ack_ratio = 0.0
-
             rst_ratio = 0.0
-
             fin_ratio = 0.0
 
-
-
         # ----------------------------------------------------
-
         # Inter-arrival
-
         # ----------------------------------------------------
-
-
 
         if len(timestamps) > 1:
 
-
-
             intervals = [
 
-
-
                 timestamps[i]
-
                 - timestamps[i - 1]
 
-
-
                 for i in range(
-
                     1,
-
                     len(timestamps)
-
                 )
-
             ]
 
-
-
             average_inter_arrival = (
-
                 sum(intervals)
-
                 / len(intervals)
-
             )
-
-
 
         else:
 
-
-
             average_inter_arrival = 0.0
-
-
 
         return {
 
-
-
             "packets":
-
                 packets,
 
-
-
             "bytes":
-
                 bytes_count,
 
-
-
             "unique_destination_ips":
-
                 len(
-
                     record[
-
                         "destination_ips"
-
                     ]
-
                 ),
-
-
 
             "unique_destination_ports":
-
                 len(
-
                     record[
-
                         "destination_ports"
-
                     ]
-
                 ),
 
-
-
             "duration":
-
                 duration,
 
-
-
             "packets_per_sec":
-
                 packets_per_sec,
 
-
-
             "bytes_per_sec":
-
                 bytes_per_sec,
 
-
-
             "tcp_packets":
-
                 tcp_packets,
 
-
-
             "syn_packets":
-
                 record[
-
                     "syn_packets"
-
                 ],
-
-
 
             "ack_packets":
-
                 record[
-
                     "ack_packets"
-
                 ],
-
-
 
             "rst_packets":
-
                 record[
-
                     "rst_packets"
-
                 ],
-
-
 
             "fin_packets":
-
                 record[
-
                     "fin_packets"
-
                 ],
-
-
 
             "syn_ratio":
-
                 syn_ratio,
 
-
-
             "ack_ratio":
-
                 ack_ratio,
 
-
-
             "rst_ratio":
-
                 rst_ratio,
 
-
-
             "fin_ratio":
-
                 fin_ratio,
 
-
-
             "dns_packets":
-
                 record[
-
                     "dns_packets"
-
                 ],
 
-
-
             "average_inter_arrival":
-
                 average_inter_arrival,
-
         }
 
-
-
     # ========================================================
-
     # PROCESS WINDOW
-
     # ========================================================
-
-
 
     async def process_window(
-
         self,
-
         source_records,
-
         aggregate_records=None
-
     ):
 
-
-
         for source_ip, record in (
-
             source_records.items()
-
         ):
 
-
-
             features = (
-
                 self.build_features(
-
                     record
-
                 )
-
             )
-
-
 
             if features is None:
 
-
-
                 continue
 
-
-
             # ------------------------------------------------
-
             # Packet-aware Detection
-
             # ------------------------------------------------
-
-
 
             packets = (
-
                 record.get(
-
                     "packet_objects",
-
                     []
-
                 )
-
             )
-
-
 
             result = (
-
                 self.detector.analyze_with_packets(
-
                     features,
-
                     packets,
-
                 )
-
             )
 
-
-
             # ------------------------------------------------
-
             # Source-history C2 analysis
-
             # ------------------------------------------------
-
-
 
             source_history_packets = (
-
                 self.source_history.get(
-
                     source_ip,
-
                     []
-
                 )
-
             )
-
-
 
             c2_intelligence = (
-
                 self.detector.analyze_c2_intelligence(
-
                     source_history_packets
-
                 )
-
             )
-
-
 
             result["c2_intelligence"] = (
-
                 c2_intelligence
-
             )
 
-
-
             # ------------------------------------------------
-
             # Create standardized alert
-
             # ------------------------------------------------
-
-
 
             flow_id = str(
-
                 uuid.uuid4()
-
             )
-
-
 
             timestamp = datetime.now(
-
                 timezone.utc
-
             )
-
-
-
 
 
             destination_ip = (
-
                 next(
-
                     iter(
-
                         record[
-
                             "destination_ips"
-
                         ]
-
                     ),
-
                     "0.0.0.0"
-
                 )
-
             )
-
-
-
 
 
             alert_data = AlertCreate(
 
-
-
                 timestamp=timestamp,
-
-
 
                 flow_id=flow_id,
 
-
-
                 source_ip=source_ip,
-
-
 
                 destination_ip=destination_ip,
 
-
-
                 threat_class=result[
-
                     "threat_class"
-
                 ],
-
-
 
                 confidence=result[
-
                     "confidence"
-
                 ],
-
-
 
                 risk_score=result[
-
                     "risk_score"
-
                 ],
-
-
 
                 ml_risk_contribution=result[
-
                     "ml_risk_contribution"
-
                 ],
-
-
 
                 rule_contribution=result[
-
                     "rule_contribution"
-
                 ],
-
-
 
                 behavior_contribution=result[
-
                     "behavior_contribution"
-
                 ],
-
-
 
                 severity=result[
-
                     "severity"
-
                 ],
-
-
 
                 evidence=result[
-
                     "evidence"
-
                 ],
 
-
-
                 features=features,
-
-
 
             )
 
 
-
-
-
             # ------------------------------------------------
-
             # Persist alert
-
             # ------------------------------------------------
-
-
 
             db = SessionLocal()
 
-
-
             try:
 
-
-
                 saved_alert = create_alert(
-
                     db,
-
                     alert_data
-
                 )
 
-
-
             finally:
-
-
 
                 db.close()
 
 
-
-
-
             # ------------------------------------------------
-
             # Create WebSocket event
-
             # ------------------------------------------------
-
-
 
             event = {
 
-
-
                 "event_type":
-
                     "THREAT_DETECTION",
 
-
-
                 "alert_id":
-
                     saved_alert.id,
 
-
-
                 "timestamp":
-
                     timestamp.isoformat(),
 
-
-
                 "flow_id":
-
                     flow_id,
 
-
-
                 "source_ip":
-
                     source_ip,
 
-
-
                 "destination_ip":
-
                     destination_ip,
 
-
-
                 "threat_class":
-
                     result[
-
                         "threat_class"
-
                     ],
-
-
 
                 "confidence":
-
                     result[
-
                         "confidence"
-
                     ],
-
-
 
                 "ml_risk_contribution":
-
                     result[
-
                         "ml_risk_contribution"
-
                     ],
-
-
 
                 "rule_contribution":
-
                     result[
-
                         "rule_contribution"
-
                     ],
-
-
 
                 "behavior_contribution":
-
                     result[
-
                         "behavior_contribution"
-
                     ],
-
-
 
                 "risk_score":
-
                     result[
-
                         "risk_score"
-
                     ],
-
-
 
                 "severity":
-
                     result[
-
                         "severity"
-
                     ],
-
-
 
                 "evidence":
-
                     result[
-
                         "evidence"
-
                     ],
 
-
-
                 "dns_intelligence":
-
                     result.get(
-
                         "dns_intelligence",
-
                         {}
-
                     ),
-
-
 
                 "c2_intelligence":
-
                     result.get(
-
                         "c2_intelligence",
-
                         {}
-
                     ),
-
-
 
                 "c2_classification":
-
                     result.get(
-
                         "c2_intelligence",
-
                         {}
-
                     ).get(
-
                         "c2_classification",
-
                         "C2_UNLIKELY"
-
                     ),
-
-
 
                 "c2_behavior_score":
-
                     result.get(
-
                         "c2_intelligence",
-
                         {}
-
                     ).get(
-
                         "c2_behavior_score",
-
                         0.0
-
                     ),
-
-
 
                 "features":
-
                     features
-
             }
 
-
-
             # ------------------------------------------------
-
             # Broadcast event
-
             # ------------------------------------------------
-
-
 
             await self.manager.broadcast(
-
                 event
-
             )
 
-
-
             print(
-
                 "[DATABASE] Alert saved:"
-
                 f" ID={saved_alert.id}"
-
             )
-
-
 
             print(
-
                 "[WEBSOCKET] Event broadcast:"
-
                 f" {source_ip} → "
-
                 f"{result['threat_class']}"
-
             )
 
+            # ========================================================
+            # DESTINATION-LEVEL SYN FLOOD DETECTION
+            # ========================================================
 
+            if aggregate_records:
 
-        # ========================================================
+                for destination_ip, record in aggregate_records.items():
 
-        # DESTINATION-LEVEL SYN FLOOD DETECTION
-
-        # ========================================================
-
-
-
-        if aggregate_records:
-
-
-
-            for destination_ip, record in aggregate_records.items():
-
-
-
-                syn_packets = record.get(
-
-                    "syn_packets",
-
-                    0
-
-                )
-
-
-
-                tcp_packets = record.get(
-
-                    "tcp_packets",
-
-                    0
-
-                )
-
-
-
-                packets = record.get(
-
-                    "packet_objects",
-
-                    []
-
-                )
-
-
-
-                unique_sources = len(
-
-                    set(
-
-                        packet[IP].src
-
-                        for packet in packets
-
-                        if IP in packet
-
+                    syn_packets = record.get(
+                        "syn_packets",
+                        0
                     )
 
-                )
-
-
-
-                if tcp_packets == 0:
-
-                    continue
-
-
-
-                syn_ratio = (
-
-                    syn_packets / tcp_packets
-
-                )
-
-
-
-                # Detect distributed / spoofed SYN flood.
-
-                if not (
-
-                    tcp_packets >= 50
-
-                    and syn_packets >= 50
-
-                    and syn_ratio >= 0.80
-
-                    and unique_sources >= 10
-
-                ):
-
-                    continue
-
-
-
-                features = self.build_features(
-
-                    record
-
-                )
-
-
-
-                if features is None:
-
-                    continue
-
-
-
-                flow_id = str(
-
-                    uuid.uuid4()
-
-                )
-
-
-
-                timestamp = datetime.now(
-
-                    timezone.utc
-
-                )
-
-
-
-                evidence = [
-
-                    (
-
-                        "[DISTRIBUTED_SYN_FLOOD] "
-
-                        f"{syn_packets} SYN packets "
-
-                        f"from {unique_sources} unique "
-
-                        f"source IPs targeting "
-
-                        f"{destination_ip}"
-
-                    ),
-
-                    (
-
-                        "[AGGREGATE_SYN_RATIO] "
-
-                        f"SYN ratio {syn_ratio:.2f}"
-
-                    ),
-
-                ]
-
-
-
-                alert_data = AlertCreate(
-
-                    timestamp=timestamp,
-
-                    flow_id=flow_id,
-
-                    source_ip="MULTIPLE_SOURCES",
-
-                    destination_ip=destination_ip,
-
-                    threat_class="DDOS",
-
-                    confidence=0.95,
-
-                    risk_score=95.0,
-
-                    ml_risk_contribution=0.0,
-
-                    rule_contribution=30.0,
-
-                    behavior_contribution=20.0,
-
-                    severity="CRITICAL",
-
-                    evidence=evidence,
-
-                    features=features,
-
-                )
-
-
-
-                db = SessionLocal()
-
-
-
-                try:
-
-
-
-                    saved_alert = create_alert(
-
-                        db,
-
-                        alert_data
-
+                    tcp_packets = record.get(
+                        "tcp_packets",
+                        0
                     )
 
+                    packets = record.get(
+                        "packet_objects",
+                        []
+                    )
 
+                    unique_sources = len(
+                        set(
+                            packet[IP].src
+                            for packet in packets
+                            if IP in packet
+                        )
+                    )
 
-                finally:
+                    if tcp_packets == 0:
+                        continue
 
+                    syn_ratio = (
+                        syn_packets / tcp_packets
+                    )
 
+                    # Detect distributed / spoofed SYN flood.
+                    if not (
+                        tcp_packets >= 50
+                        and syn_packets >= 50
+                        and syn_ratio >= 0.80
+                        and unique_sources >= 10
+                    ):
+                        continue
 
-                    db.close()
+                    features = self.build_features(
+                        record
+                    )
 
+                    if features is None:
+                        continue
 
+                    flow_id = str(
+                        uuid.uuid4()
+                    )
 
-                event = {
+                    timestamp = datetime.now(
+                        timezone.utc
+                    )
 
-                    "event_type": "THREAT_DETECTION",
+                    evidence = [
+                        (
+                            "[DISTRIBUTED_SYN_FLOOD] "
+                            f"{syn_packets} SYN packets "
+                            f"from {unique_sources} unique "
+                            f"source IPs targeting "
+                            f"{destination_ip}"
+                        ),
+                        (
+                            "[AGGREGATE_SYN_RATIO] "
+                            f"SYN ratio {syn_ratio:.2f}"
+                        ),
+                    ]
 
-                    "alert_id": saved_alert.id,
+                    alert_data = AlertCreate(
+                        timestamp=timestamp,
+                        flow_id=flow_id,
+                        source_ip="MULTIPLE_SOURCES",
+                        destination_ip=destination_ip,
+                        threat_class="DDOS",
+                        confidence=0.95,
+                        risk_score=95.0,
+                        ml_risk_contribution=0.0,
+                        rule_contribution=30.0,
+                        behavior_contribution=20.0,
+                        severity="CRITICAL",
+                        evidence=evidence,
+                        features=features,
+                    )
 
-                    "timestamp": timestamp.isoformat(),
+                    db = SessionLocal()
 
-                    "flow_id": flow_id,
+                    try:
 
-                    "source_ip": "MULTIPLE_SOURCES",
+                        saved_alert = create_alert(
+                            db,
+                            alert_data
+                        )
 
-                    "destination_ip": destination_ip,
+                    finally:
 
-                    "threat_class": "DDOS",
+                        db.close()
 
-                    "confidence": 0.95,
+                    event = {
+                        "event_type": "THREAT_DETECTION",
+                        "alert_id": saved_alert.id,
+                        "timestamp": timestamp.isoformat(),
+                        "flow_id": flow_id,
+                        "source_ip": "MULTIPLE_SOURCES",
+                        "destination_ip": destination_ip,
+                        "threat_class": "DDOS",
+                        "confidence": 0.95,
+                        "ml_risk_contribution": 0.0,
+                        "rule_contribution": 30.0,
+                        "behavior_contribution": 20.0,
+                        "risk_score": 95.0,
+                        "severity": "CRITICAL",
+                        "evidence": evidence,
+                        "dns_intelligence": {},
+                        "c2_intelligence": {},
+                        "c2_classification": "C2_UNLIKELY",
+                        "c2_behavior_score": 0.0,
+                        "features": features,
+                        "aggregate_detection": True,
+                        "unique_source_ips": unique_sources,
+                    }
 
-                    "ml_risk_contribution": 0.0,
+                    await self.manager.broadcast(
+                        event
+                    )
 
-                    "rule_contribution": 30.0,
-
-                    "behavior_contribution": 20.0,
-
-                    "risk_score": 95.0,
-
-                    "severity": "CRITICAL",
-
-                    "evidence": evidence,
-
-                    "dns_intelligence": {},
-
-                    "c2_intelligence": {},
-
-                    "c2_classification": "C2_UNLIKELY",
-
-                    "c2_behavior_score": 0.0,
-
-                    "features": features,
-
-                    "aggregate_detection": True,
-
-                    "unique_source_ips": unique_sources,
-
-                }
-
-
-
-                await self.manager.broadcast(
-
-                    event
-
-                )
-
-
-
-                print(
-
-                    "[AGGREGATE DDoS] "
-
-                    f"{unique_sources} sources → "
-
-                    f"{destination_ip} "
-
-                    f"({syn_packets} SYN packets)"
-
-                )
-
-
-
-# ========================================================
-
-    # STREAM PCAP
+                    print(
+                        "[AGGREGATE DDoS] "
+                        f"{unique_sources} sources → "
+                        f"{destination_ip} "
+                        f"({syn_packets} SYN packets)"
+                    )
 
     # ========================================================
-
-
+    # STREAM PCAP
+    # ========================================================
 
     async def stream_pcap(
-
         self,
-
         pcap_file
-
     ):
 
-
-
         if not os.path.exists(
-
             pcap_file
-
         ):
 
-
-
             print(
-
                 f"[STREAM] PCAP not found: "
-
                 f"{pcap_file}"
-
             )
-
-
 
             return
 
-
-
         packets = rdpcap(
-
             pcap_file
-
         )
-
-
 
         if len(packets) == 0:
 
-
-
             print(
-
                 "[STREAM] No packets found."
-
             )
-
-
 
             return
 
-
-
         print()
-
         print(
-
             "=" * 70
-
         )
-
         print(
-
             "STEP 17 — WEBSOCKET LIVE STREAM"
-
         )
-
         print(
-
             "=" * 70
-
         )
 
-
-
         print(
-
             f"PCAP: {pcap_file}"
-
         )
-
-
 
         print(
-
             f"Packets: {len(packets)}"
-
         )
-
-
 
         print()
-
-
 
         self.running = True
 
-
-
         self.source_history = {}
 
-
-
         first_timestamp = float(
-
             packets[0].time
-
         )
-
-
 
         window_start = (
-
             first_timestamp
-
         )
-
-
 
         previous_timestamp = (
-
             first_timestamp
-
         )
 
-
-
         current_window = {}
-
         aggregate_window = {}
-
-
 
         for packet in packets:
 
-
-
             if not self.running:
-
-
 
                 break
 
-
-
             timestamp = float(
-
                 packet.time
-
             )
 
-
-
             # ------------------------------------------------
-
             # Replay delay
-
             # ------------------------------------------------
-
-
 
             delay = (
-
                 timestamp
-
                 - previous_timestamp
-
             )
-
-
 
             if delay > 0:
 
-
-
                 await asyncio.sleep(
-
                     min(delay, 0.5)
-
                 )
-
-
 
             previous_timestamp = timestamp
 
-
-
             # ------------------------------------------------
-
             # Window boundary
-
             # ------------------------------------------------
-
-
 
             while (
-
                 timestamp
-
                 >=
-
                 window_start
-
                 + WINDOW_SIZE
-
             ):
-
-
 
                 if current_window:
 
-
-
                     await self.process_window(
-
                         current_window,
-
                         aggregate_window
-
                     )
 
-
-
                 current_window = {}
-
                 aggregate_window = {}
 
-
-
                 window_start += (
-
                     WINDOW_SIZE
-
                 )
 
-
-
             # ------------------------------------------------
-
             # Ignore non-IP
-
             # ------------------------------------------------
-
-
 
             if IP not in packet:
 
-
-
                 continue
 
-
-
             source_ip = packet[
-
                 IP
-
             ].src
 
-
-
             if (
-
                 source_ip
-
                 not in current_window
-
             ):
 
-
-
                 current_window[
-
                     source_ip
-
                 ] = (
-
                     self.create_source_record()
-
                 )
 
-
-
             self.process_packet(
-
                 current_window[
-
                     source_ip
-
                 ],
-
                 packet
-
             )
-
-
 
             destination_ip = packet[
-
                 IP
-
             ].dst
 
-
-
             if (
-
                 destination_ip
-
                 not in aggregate_window
-
             ):
 
-
-
                 aggregate_window[
-
                     destination_ip
-
                 ] = (
-
                     self.create_source_record()
-
                 )
 
-
-
             self.process_packet(
-
                 aggregate_window[
-
                     destination_ip
-
                 ],
-
                 packet,
-
                 update_history=False
-
             )
 
-
-
         # ----------------------------------------------------
-
         # Final window
-
         # ----------------------------------------------------
-
-
 
         if current_window:
 
-
-
             await self.process_window(
-
                 current_window,
-
                 aggregate_window
-
             )
-
-
 
         self.running = False
 
-
-
         print()
 
-
-
         print(
-
             "=" * 70
-
         )
 
-
-
         print(
-
             "WEBSOCKET PCAP STREAM COMPLETE"
-
         )
-
-
 
         print(
-
             "=" * 70
-
         )
 
-
-
     # ========================================================
-
     # STOP
-
     # ========================================================
-
-
 
     def stop(self):
-
-
 
         self.running = False
